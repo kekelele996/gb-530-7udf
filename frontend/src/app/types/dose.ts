@@ -69,10 +69,25 @@ export interface DoseBudgetAssessment {
   review_note: string;
 }
 
+export interface ScenarioInput {
+  plan_id: number;
+  as_of?: string;
+}
+
+export interface ScenarioResult extends DoseBudgetAssessment {
+  period_start: string;
+  period_end: string;
+  as_of: string;
+  as_of_source: 'explicit' | 'aligned_earliest' | 'request_period_end';
+}
+
 export interface ScenarioComparison {
   worker_id: number;
+  /** Mirrors the first scenario window; use each scenario's period_start/period_end when period_ends_aligned is false. */
   period_dose_msv: number;
-  scenarios: DoseBudgetAssessment[];
+  scenarios: ScenarioResult[];
   highest_risk_band: DoseBand;
   boundary_statement: string;
+  period_ends_aligned: boolean;
+  as_of_notice?: string;
 }

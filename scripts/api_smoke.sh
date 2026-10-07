@@ -80,14 +80,34 @@ plan_version="$(jq -r '.data.version' <<<"$last_body")"
 request "create comparison plan" 201 POST "/plans" "$planner_token" "$(jq -nc --argjson worker "$worker_id" '{plan_code:"QA-ALARA-530-LO",worker_id:$worker,work_area:"QA controlled bay",task_category:"Remote survey",estimated_rate_msvh:0.1,planned_minutes:30,controls:["distance markers","remote reading"]}')"
 comparison_plan_id="$(jq -r '.data.id' <<<"$last_body")"
 
-period_end="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg end "$period_end" '{plan_id:$plan,period_end:$end,version:$version}')"
+# Entries carry second-granularity occurred_at; push the cut-off one second
+# forward so the half-open [start, end) window includes records created in this run.
+period_end="$(date -u -d '+1 second' +'%Y-%m-%dT%H:%M:%SZ')"
+request "calculate immutable assessment" 201 POST "/assessments" "$planner_token" "$(jq -nc --argjson plan "$plan_id" --argjson version "$plan_version" --arg cutoff "$period_end" '{plan_id:$plan,period_end:$cutoff,version:$version}')"
 assessment_id="$(jq -r '.data.id' <<<"$last_body")"
 assessed_version="$(jq -r '.data.plan_version' <<<"$last_body")"
 require_json '.data.period_dose_msv == 0.3 and .data.projected_dose_msv == 1.8 and .data.risk_band == "above_legal" and .data.evidence.requires_manual_review == true' "corrected total, projection and threshold escalation"
 
-request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg end "$period_end" '{plan_ids:[$first,$second],period_end:$end}')"
+request "compare two time-weighted scenarios" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg cutoff "$period_end" '{scenarios:[{plan_id:$first},{plan_id:$second}],period_end:$cutoff}')"
 require_json '.data.scenarios | length == 2' "two comparison scenarios"
+require_json '.data.scenarios[0].period_start != null and .data.scenarios[0].period_end != null and .data.scenarios[0].as_of != null' "scenarios carry their own window and as-of"
+require_json '[.data.scenarios[].as_of_source] | all(. == "request_period_end")' "no explicit as_of falls back to request period end"
+require_json '.data.period_ends_aligned == true' "identical windows reported aligned"
+
+before_correction_asof="$(date -u -d '2026-01-02 00:00:00' +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+if [[ -n "$before_correction_asof" ]]; then
+  request "compare with historical as_of excludes later evidence" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg early "$before_correction_asof" --arg cutoff "$period_end" '{scenarios:[{plan_id:$first,as_of:$early},{plan_id:$second}],period_end:$cutoff}')"
+  require_json '.data.scenarios[0].period_dose_msv == 0 and .data.scenarios[0].as_of_source == "explicit" and .data.scenarios[1].as_of_source == "aligned_earliest"' "missing as_of aligns to earliest explicit cut-off"
+  require_json '.data.period_ends_aligned == true and (.data.as_of_notice | length > 0)' "aligned batch keeps one window and explains the fill-in"
+
+  request "compare scenarios at distinct explicit as_of" 200 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg early "$before_correction_asof" --arg cutoff "$period_end" '{scenarios:[{plan_id:$first,as_of:$cutoff},{plan_id:$second,as_of:$early}]}')"
+  require_json '.data.scenarios[0].period_dose_msv == 0.3 and .data.scenarios[1].period_dose_msv == 0' "each scenario recalculates over its own window"
+  require_json '([.data.scenarios[].as_of_source] | all(. == "explicit")) and .data.period_ends_aligned == false and (.data.as_of_notice | length > 0)' "different windows are flagged"
+
+  future_asof="$(date -u -d '+2 days' +'%Y-%m-%dT%H:%M:%SZ')"
+  request "future as_of rejected" 400 POST "/assessments/compare" "$planner_token" "$(jq -nc --argjson first "$plan_id" --argjson second "$comparison_plan_id" --arg future "$future_asof" '{scenarios:[{plan_id:$first,as_of:$future},{plan_id:$second,as_of:$future}]}')"
+  require_json '.error.code == "invalid_period"' "future cut-off error code"
+fi
 
 request "submit assessment to RPO" 200 POST "/assessments/$assessment_id/submit" "$planner_token" "$(jq -nc --argjson version "$assessed_version" '{version:$version}')"
 review_version="$(jq -r '.data.plan_version' <<<"$last_body")"

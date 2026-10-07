@@ -48,7 +48,7 @@ docker compose down -v --remove-orphans
 - 不可变更正：原值禁止覆盖；一次更正事务创建负值 reversal 和新 replacement，完整保留链路。
 - 作业计划：使用统一 mSv/mSv/h 单位维护剂量率、分钟数和具体控制措施。
 - 剂量评估：冻结人员/计划版本、期间记录 ID、公式、阈值版本和控制措施，结果追加写入而非覆盖。
-- 情景比较：对同一人员的多个计划做时间加权投影并比较风险带，不落库、不改变状态。
+- 情景比较：对同一人员的多个计划按各自评估时点（`scenarios[].as_of`）重算累计、投影与风险带并比较，不落库、不改变状态。起点固定为人员周期起点；未带 `as_of` 的情景对齐到本批最早的显式时点（一批都未带时才使用请求级 `period_end`），避免把比较之后才核验的记录算入口径；时点晚于当下（5 分钟时钟容差）或窗口超过 370 天返回 `invalid_period`，同批窗口不一致时在 `as_of_notice` 中提示。
 - 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`。
 - 操作审计：记录 request ID、操作者、参数摘要与前后状态；普通 API 不提供删除能力。
 
@@ -65,6 +65,7 @@ docker compose down -v --remove-orphans
 
 - 期间采用半开区间 `[period_start, period_end)`，边界有表驱动测试。
 - 仅 `quality_flag=verified` 的记录参与汇总；pending/rejected 会写入排除证据。
+- 比较情景按评估时点截断证据：记录除 `occurred_at` 落在窗口内，其 `verified_at` 还必须不晚于该情景 `as_of`，使历史时点的比较不会纳入后来核验的记录。
 - 更正链按原始值 + reversal + replacement 求和，链循环、跨人员关联和重复 `source_ref` 会被拒绝。
 - `near_legal` 默认从法规限值的 90% 开始；阈值版本默认 `ALARA-2026.1`。
 - 负余量、负累计和非有限值会被阻断或钳制，不会返回 NaN。
@@ -126,7 +127,7 @@ docker compose down -v --remove-orphans
 | POST | `/exposures/:id/verify` | RPO 核验或拒绝来源 |
 | POST | `/exposures/:id/correct` | RPO 创建不可变 reversal/replacement 链 |
 | GET/POST | `/assessments[/:id]` | 列表、详情和不可变评估 |
-| POST | `/assessments/compare` | 同一人员多计划情景比较 |
+| POST | `/assessments/compare` | 同一人员多计划情景比较，支持 `scenarios:[{plan_id,as_of}]` 每计划独立评估时点（兼容旧的 `plan_ids`+`period_end`） |
 | POST | `/assessments/:id/submit` | 提交 RPO 人工复核 |
 | POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝 |
 | GET | `/audit` | RPO/admin 查询审计 |

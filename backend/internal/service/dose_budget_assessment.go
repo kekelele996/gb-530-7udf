@@ -67,14 +67,11 @@ func (service *DoseBudgetAssessmentService) Assess(
 		if err != nil {
 			return MapRepositoryError("plan worker", err)
 		}
-		period, err := dosebudget.NewPeriod(worker.PeriodStart, request.PeriodEnd)
-		if err != nil {
+		if err := dosebudget.ValidateAssessmentWindow(worker.PeriodStart, request.PeriodEnd, time.Now().UTC()); err != nil {
 			return BadRequest("invalid_period", err.Error())
 		}
-		if request.PeriodEnd.After(time.Now().UTC().Add(5 * time.Minute)) {
-			return BadRequest("invalid_period", "period_end cannot be in the future")
-		}
-		periodEntries, err := entries.PeriodEntries(worker.ID, period.Start, period.End)
+		period, _ := dosebudget.NewPeriod(worker.PeriodStart, request.PeriodEnd)
+		periodEntries, err := entries.PeriodEntries(worker.ID, period.Start, period.End, nil)
 		if err != nil {
 			return Internal("could not load period exposure entries", err)
 		}
@@ -114,49 +111,105 @@ func (service *DoseBudgetAssessmentService) Assess(
 func (service *DoseBudgetAssessmentService) Compare(
 	request dto.CompareDoseBudgetRequest,
 ) (dto.ScenarioComparisonResponse, error) {
+	inputs := request.NormalizedScenarios()
+	if len(inputs) < 2 {
+		return dto.ScenarioComparisonResponse{}, BadRequest("validation_error", "comparison needs at least two scenarios")
+	}
+	if len(inputs) > 8 {
+		return dto.ScenarioComparisonResponse{}, BadRequest("validation_error", "comparison supports at most eight scenarios")
+	}
 	seen := map[uint]bool{}
-	var worker model.WorkerProfile
-	responses := make([]dto.DoseBudgetAssessmentResponse, 0, len(request.PlanIDs))
-	highest := constants.DoseBandWithinAdmin
-	for _, planID := range request.PlanIDs {
-		if seen[planID] {
+	for _, input := range inputs {
+		if input.PlanID == 0 {
+			return dto.ScenarioComparisonResponse{}, BadRequest("validation_error", "each scenario needs a plan_id")
+		}
+		if seen[input.PlanID] {
 			return dto.ScenarioComparisonResponse{}, BadRequest("duplicate_plan", "plan_ids must be unique")
 		}
-		seen[planID] = true
-		plan, err := service.plans.Find(planID)
-		if err != nil {
-			return dto.ScenarioComparisonResponse{}, MapRepositoryError("work permit plan", err)
+		seen[input.PlanID] = true
+	}
+	explicit := make([]*time.Time, len(inputs))
+	for index := range inputs {
+		explicit[index] = inputs[index].AsOf
+	}
+	cutOffs, sources, err := dosebudget.ResolveAsOf(explicit, request.PeriodEnd)
+	if err != nil {
+		return dto.ScenarioComparisonResponse{}, BadRequest("invalid_period", err.Error())
+	}
+	now := time.Now().UTC()
+	type loaded struct {
+		plan   model.WorkPermitPlan
+		worker model.WorkerProfile
+	}
+	loadedScenarios := make([]loaded, len(inputs))
+	var worker model.WorkerProfile
+	for index, input := range inputs {
+		plan, findErr := service.plans.Find(input.PlanID)
+		if findErr != nil {
+			return dto.ScenarioComparisonResponse{}, MapRepositoryError("work permit plan", findErr)
 		}
-		candidateWorker, err := service.workers.Find(plan.WorkerID)
-		if err != nil {
-			return dto.ScenarioComparisonResponse{}, MapRepositoryError("plan worker", err)
+		candidateWorker, findErr := service.workers.Find(plan.WorkerID)
+		if findErr != nil {
+			return dto.ScenarioComparisonResponse{}, MapRepositoryError("plan worker", findErr)
 		}
 		if worker.ID == 0 {
 			worker = candidateWorker
 		} else if worker.ID != candidateWorker.ID {
 			return dto.ScenarioComparisonResponse{}, BadRequest("mixed_workers", "scenario comparison requires plans for one worker")
 		}
-		period, err := dosebudget.NewPeriod(worker.PeriodStart, request.PeriodEnd)
-		if err != nil {
-			return dto.ScenarioComparisonResponse{}, BadRequest("invalid_period", err.Error())
+		loadedScenarios[index] = loaded{plan: plan, worker: candidateWorker}
+	}
+	results := make([]dto.ScenarioResult, 0, len(inputs))
+	highest := constants.DoseBandWithinAdmin
+	aligned := true
+	firstEnd := time.Time{}
+	notice := ""
+	hasExplicit := false
+	hasAligned := false
+	for index, item := range loadedScenarios {
+		cutOff := cutOffs[index]
+		if validateErr := dosebudget.ValidateAssessmentWindow(item.worker.PeriodStart, cutOff, now); validateErr != nil {
+			return dto.ScenarioComparisonResponse{}, BadRequest("invalid_period",
+				fmt.Sprintf("plan %s: %s", item.plan.PlanCode, validateErr.Error()))
 		}
-		entries, err := service.entries.PeriodEntries(worker.ID, period.Start, period.End)
-		if err != nil {
-			return dto.ScenarioComparisonResponse{}, Internal("could not load period exposure entries", err)
+		period, _ := dosebudget.NewPeriod(item.worker.PeriodStart, cutOff)
+		entries, loadErr := service.entries.PeriodEntries(item.worker.ID, period.Start, period.End, &cutOff)
+		if loadErr != nil {
+			return dto.ScenarioComparisonResponse{}, Internal("could not load period exposure entries", loadErr)
 		}
-		assessment, err := service.calculate(plan, worker, period, entries, 0)
-		if err != nil {
-			return dto.ScenarioComparisonResponse{}, err
+		assessment, calculateErr := service.calculate(item.plan, item.worker, period, entries, 0)
+		if calculateErr != nil {
+			return dto.ScenarioComparisonResponse{}, calculateErr
 		}
-		response := assessmentResponse(assessment, plan, worker)
-		responses = append(responses, response)
+		response := assessmentResponse(assessment, item.plan, item.worker)
+		results = append(results, dto.ScenarioResult{
+			DoseBudgetAssessmentResponse: response,
+			PeriodStart:                  period.Start, PeriodEnd: period.End, AsOf: cutOff, AsOfSource: sources[index],
+		})
 		if dosebudget.RiskRank(response.RiskBand) > dosebudget.RiskRank(highest) {
 			highest = response.RiskBand
 		}
+		if index == 0 {
+			firstEnd = period.End
+		} else if !period.End.Equal(firstEnd) {
+			aligned = false
+		}
+		switch sources[index] {
+		case dosebudget.AsOfSourceExplicit:
+			hasExplicit = true
+		case dosebudget.AsOfSourceAlignedEarliest:
+			hasAligned = true
+		}
+	}
+	if !aligned {
+		notice = "Scenarios use different evaluation windows; each row is recalculated over its own [period start, as-of) range."
+	} else if hasExplicit && hasAligned {
+		notice = "Scenarios without as_of were aligned to the earliest explicit as_of in this batch to keep the evidence cut-off consistent."
 	}
 	return dto.ScenarioComparisonResponse{
-		WorkerID: worker.ID, PeriodDoseMSV: responses[0].PeriodDoseMSV, Scenarios: responses,
+		WorkerID: worker.ID, PeriodDoseMSV: results[0].PeriodDoseMSV, Scenarios: results,
 		HighestRiskBand: highest, BoundaryStatement: dosebudget.BoundaryStatement,
+		PeriodEndsAligned: aligned, AsOfNotice: notice,
 	}, nil
 }
 

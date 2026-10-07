@@ -77,10 +77,17 @@ func (repository *ExposureEntryRepository) List(page, pageSize int, workerID uin
 	return entries, total, nil
 }
 
-func (repository *ExposureEntryRepository) PeriodEntries(workerID uint, start, end time.Time) ([]model.ExposureEntry, error) {
+// PeriodEntries returns entries whose occurred_at falls in the half-open
+// [start, end) window. When asOf is non-nil the evidence cut-off is enforced as
+// well: only records verified at or before asOf are returned, so a historical
+// comparison cannot include entries verified after its evaluation point.
+func (repository *ExposureEntryRepository) PeriodEntries(workerID uint, start, end time.Time, asOf *time.Time) ([]model.ExposureEntry, error) {
 	var entries []model.ExposureEntry
-	err := repository.db.Where("worker_id = ? AND occurred_at >= ? AND occurred_at < ?", workerID, start, end).
-		Order("occurred_at ASC, id ASC").Find(&entries).Error
+	query := repository.db.Where("worker_id = ? AND occurred_at >= ? AND occurred_at < ?", workerID, start, end)
+	if asOf != nil {
+		query = query.Where("verified_at IS NOT NULL AND verified_at <= ?", asOf.UTC())
+	}
+	err := query.Order("occurred_at ASC, id ASC").Find(&entries).Error
 	if err != nil {
 		return nil, fmt.Errorf("list period exposure entries: %w", err)
 	}

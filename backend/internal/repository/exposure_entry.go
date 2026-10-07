@@ -7,6 +7,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"radiation-dose-budget-control/backend/internal/constants"
 	"radiation-dose-budget-control/backend/internal/model"
 )
 
@@ -83,6 +84,25 @@ func (repository *ExposureEntryRepository) PeriodEntries(workerID uint, start, e
 		Order("occurred_at ASC, id ASC").Find(&entries).Error
 	if err != nil {
 		return nil, fmt.Errorf("list period exposure entries: %w", err)
+	}
+	return entries, nil
+}
+
+// PeriodEntriesAsOf returns the evidence available at asOf: entries that
+// occurred inside [start, end) and were either never verified or verified no
+// later than asOf. Entries verified after asOf (including reversals and
+// replacements created by a later correction) are excluded, so a record
+// verified after the evaluation cut-off cannot leak into a historical
+// comparison. Non-verified entries stay in the result set so the summarizer
+// counts them as excluded evidence.
+func (repository *ExposureEntryRepository) PeriodEntriesAsOf(workerID uint, start, end, asOf time.Time) ([]model.ExposureEntry, error) {
+	var entries []model.ExposureEntry
+	err := repository.db.Where(
+		"worker_id = ? AND occurred_at >= ? AND occurred_at < ? AND (quality_flag <> ? OR verified_at IS NULL OR verified_at <= ?)",
+		workerID, start, end, constants.QualityFlagVerified, asOf,
+	).Order("occurred_at ASC, id ASC").Find(&entries).Error
+	if err != nil {
+		return nil, fmt.Errorf("list as-of period exposure entries: %w", err)
 	}
 	return entries, nil
 }

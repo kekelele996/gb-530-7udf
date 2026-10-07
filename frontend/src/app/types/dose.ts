@@ -63,15 +63,25 @@ export interface DoseBudgetAssessment {
   threshold_version: string;
   plan_version: number;
   worker_version: number;
+  as_of: string;
+  as_of_source: 'assessment' | 'scenario' | 'batch_default' | 'batch_anchor';
   created_at: string;
   reviewed_by?: number;
   reviewed_at?: string;
   review_note: string;
 }
 
+export interface CompareScenarioInput {
+  plan_id: number;
+  as_of?: string;
+}
+
 export interface ScenarioComparison {
   worker_id: number;
   period_dose_msv: number;
+  as_of_anchor: string;
+  as_of_mismatch: boolean;
+  as_of_notice: string;
   scenarios: DoseBudgetAssessment[];
   highest_risk_band: DoseBand;
   boundary_statement: string;

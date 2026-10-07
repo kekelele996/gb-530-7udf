@@ -8,9 +8,16 @@ type CreateDoseBudgetAssessmentRequest struct {
 	Version   uint      `json:"version" validate:"required,gt=0"`
 }
 
+type CompareScenarioInput struct {
+	PlanID uint       `json:"plan_id" validate:"required,gt=0"`
+	AsOf   *time.Time `json:"as_of"`
+}
+
 type CompareDoseBudgetRequest struct {
-	PlanIDs   []uint    `json:"plan_ids" validate:"required,min=2,max=8,dive,gt=0"`
-	PeriodEnd time.Time `json:"period_end" validate:"required"`
+	PlanIDs     []uint                 `json:"plan_ids" validate:"max=8,dive,gt=0"`
+	Scenarios   []CompareScenarioInput `json:"scenarios" validate:"max=8,dive"`
+	PeriodEnd   *time.Time             `json:"period_end"`
+	DefaultAsOf *time.Time             `json:"default_as_of"`
 }
 
 type AssessmentReviewRequest struct {
@@ -54,6 +61,8 @@ type DoseBudgetAssessmentResponse struct {
 	ThresholdVersion  string                 `json:"threshold_version"`
 	PlanVersion       uint                   `json:"plan_version"`
 	WorkerVersion     uint                   `json:"worker_version"`
+	AsOf              time.Time              `json:"as_of"`
+	AsOfSource        string                 `json:"as_of_source"`
 	CreatedAt         time.Time              `json:"created_at"`
 	ReviewedBy        *uint                  `json:"reviewed_by,omitempty"`
 	ReviewedAt        *time.Time             `json:"reviewed_at,omitempty"`
@@ -63,6 +72,9 @@ type DoseBudgetAssessmentResponse struct {
 type ScenarioComparisonResponse struct {
 	WorkerID          uint                           `json:"worker_id"`
 	PeriodDoseMSV     float64                        `json:"period_dose_msv"`
+	AsOfAnchor        time.Time                      `json:"as_of_anchor"`
+	AsOfMismatch      bool                           `json:"as_of_mismatch"`
+	AsOfNotice        string                         `json:"as_of_notice"`
 	Scenarios         []DoseBudgetAssessmentResponse `json:"scenarios"`
 	HighestRiskBand   string                         `json:"highest_risk_band"`
 	BoundaryStatement string                         `json:"boundary_statement"`

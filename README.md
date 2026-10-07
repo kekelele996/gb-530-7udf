@@ -48,7 +48,7 @@ docker compose down -v --remove-orphans
 - 不可变更正：原值禁止覆盖；一次更正事务创建负值 reversal 和新 replacement，完整保留链路。
 - 作业计划：使用统一 mSv/mSv/h 单位维护剂量率、分钟数和具体控制措施。
 - 剂量评估：冻结人员/计划版本、期间记录 ID、公式、阈值版本和控制措施，结果追加写入而非覆盖。
-- 情景比较：对同一人员的多个计划做时间加权投影并比较风险带，不落库、不改变状态。
+- 情景比较：对同一人员的多个计划按各自评估时点（`as_of`）重算期间累计、投影和风险带，比较表展示每个情景的 `[period_start, as_of)` 起止；不落库、不改变状态。
 - 人工状态机：`draft -> assessed -> pending_rpo_review -> planning_accepted | rejected -> archived`。
 - 操作审计：记录 request ID、操作者、参数摘要与前后状态；普通 API 不提供删除能力。
 
@@ -64,6 +64,10 @@ docker compose down -v --remove-orphans
 ```
 
 - 期间采用半开区间 `[period_start, period_end)`，边界有表驱动测试。
+- 情景比较支持每计划自带评估时点 `as_of`：各情景按自己实际使用的 `[period_start, as_of)` 重算累计、投影与风险带；起点恒为该人员 `period_start`。仅纳入 `verified_at <= as_of` 的经核验记录，晚于时点核验的记录（含更正 reversal/replacement）不计入，避免把后来核验的证据泄露进早期时点的比较。
+- 未带 `as_of` 的情景：当同批已有显式时点时，统一对齐到本批最早时点（`as_of_source=batch_anchor`）；整批都未带时才使用请求级默认（`default_as_of`，兼容旧字段 `period_end`，`as_of_source=batch_default`）。选择对齐最早时点而非按“当下”计算，是为了让同一批比较口径一致，后来核验的记录不会混入。
+- 同批有效时点不一致时，响应返回 `as_of_mismatch=true` 与 `as_of_notice`，预算页比较表顶部高亮提示，并新增“Period start – cut-off (UTC)”列显示每个情景起止。
+- `as_of` 不得晚于当下，且窗口（自该人员周期起点起）不得超过 370 天，否则返回 `400 invalid_period`；整批缺少任何可用时点返回 `400 missing_as_of`。
 - 仅 `quality_flag=verified` 的记录参与汇总；pending/rejected 会写入排除证据。
 - 更正链按原始值 + reversal + replacement 求和，链循环、跨人员关联和重复 `source_ref` 会被拒绝。
 - `near_legal` 默认从法规限值的 90% 开始；阈值版本默认 `ALARA-2026.1`。
@@ -126,7 +130,7 @@ docker compose down -v --remove-orphans
 | POST | `/exposures/:id/verify` | RPO 核验或拒绝来源 |
 | POST | `/exposures/:id/correct` | RPO 创建不可变 reversal/replacement 链 |
 | GET/POST | `/assessments[/:id]` | 列表、详情和不可变评估 |
-| POST | `/assessments/compare` | 同一人员多计划情景比较 |
+| POST | `/assessments/compare` | 同一人员多计划情景比较，支持 `scenarios[].as_of` 各自评估时点，或旧版 `plan_ids` + `period_end`/`default_as_of` |
 | POST | `/assessments/:id/submit` | 提交 RPO 人工复核 |
 | POST | `/assessments/:id/review` | RPO 记录规划接受或拒绝 |
 | GET | `/audit` | RPO/admin 查询审计 |

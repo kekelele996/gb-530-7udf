@@ -1,7 +1,7 @@
 import { Injectable, inject, signal } from '@angular/core';
 import { tap } from 'rxjs';
 import { AssessmentsApi } from '../api/assessments.api';
-import { DoseBudgetAssessment, ScenarioComparison } from '../types/dose';
+import { CompareScenarioInput, DoseBudgetAssessment, ScenarioComparison } from '../types/dose';
 
 @Injectable({ providedIn: 'root' })
 export class BudgetStore {
@@ -30,8 +30,8 @@ export class BudgetStore {
     }));
   }
 
-  compare(planIds: number[], periodEnd: string) {
-    return this.api.compare(planIds, periodEnd).pipe(tap(response => this.comparison.set(response.data)));
+  compare(scenarios: CompareScenarioInput[], defaultAsOf?: string) {
+    return this.api.compare(scenarios, defaultAsOf).pipe(tap(response => this.comparison.set(response.data)));
   }
 
   submit(id: number, version: number) {

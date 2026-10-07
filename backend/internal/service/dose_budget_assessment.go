@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -114,16 +115,19 @@ func (service *DoseBudgetAssessmentService) Assess(
 func (service *DoseBudgetAssessmentService) Compare(
 	request dto.CompareDoseBudgetRequest,
 ) (dto.ScenarioComparisonResponse, error) {
+	scenarioInputs, err := normalizeCompareScenarios(request)
+	if err != nil {
+		return dto.ScenarioComparisonResponse{}, err
+	}
 	seen := map[uint]bool{}
 	var worker model.WorkerProfile
-	responses := make([]dto.DoseBudgetAssessmentResponse, 0, len(request.PlanIDs))
-	highest := constants.DoseBandWithinAdmin
-	for _, planID := range request.PlanIDs {
-		if seen[planID] {
-			return dto.ScenarioComparisonResponse{}, BadRequest("duplicate_plan", "plan_ids must be unique")
+	loadedPlans := make(map[uint]model.WorkPermitPlan, len(scenarioInputs))
+	for _, scenario := range scenarioInputs {
+		if seen[scenario.PlanID] {
+			return dto.ScenarioComparisonResponse{}, BadRequest("duplicate_plan", "scenario plan_ids must be unique")
 		}
-		seen[planID] = true
-		plan, err := service.plans.Find(planID)
+		seen[scenario.PlanID] = true
+		plan, err := service.plans.Find(scenario.PlanID)
 		if err != nil {
 			return dto.ScenarioComparisonResponse{}, MapRepositoryError("work permit plan", err)
 		}
@@ -136,11 +140,39 @@ func (service *DoseBudgetAssessmentService) Compare(
 		} else if worker.ID != candidateWorker.ID {
 			return dto.ScenarioComparisonResponse{}, BadRequest("mixed_workers", "scenario comparison requires plans for one worker")
 		}
-		period, err := dosebudget.NewPeriod(worker.PeriodStart, request.PeriodEnd)
+		loadedPlans[plan.ID] = plan
+	}
+	batchDefault := request.DefaultAsOf
+	if batchDefault == nil {
+		// Legacy callers still send period_end; keep it as the batch-level default.
+		batchDefault = request.PeriodEnd
+	}
+	planIDs := make([]uint, 0, len(scenarioInputs))
+	explicitAsOf := make(map[uint]time.Time, len(scenarioInputs))
+	for _, scenario := range scenarioInputs {
+		planIDs = append(planIDs, scenario.PlanID)
+		if scenario.AsOf != nil {
+			explicitAsOf[scenario.PlanID] = scenario.AsOf.UTC()
+		}
+	}
+	now := time.Now().UTC()
+	resolved, anchor, mismatch, err := dosebudget.ResolveCutOffs(planIDs, explicitAsOf, batchDefault, worker.PeriodStart, now)
+	if err != nil {
+		code := "invalid_period"
+		if errors.Is(err, dosebudget.ErrMissingAsOf) {
+			code = "missing_as_of"
+		}
+		return dto.ScenarioComparisonResponse{}, BadRequest(code, err.Error())
+	}
+	responses := make([]dto.DoseBudgetAssessmentResponse, 0, len(resolved))
+	highest := constants.DoseBandWithinAdmin
+	for _, resolvedScenario := range resolved {
+		plan := loadedPlans[resolvedScenario.PlanID]
+		period, err := dosebudget.NewPeriod(worker.PeriodStart, resolvedScenario.AsOf)
 		if err != nil {
 			return dto.ScenarioComparisonResponse{}, BadRequest("invalid_period", err.Error())
 		}
-		entries, err := service.entries.PeriodEntries(worker.ID, period.Start, period.End)
+		entries, err := service.entries.PeriodEntriesAsOf(worker.ID, period.Start, period.End, period.End)
 		if err != nil {
 			return dto.ScenarioComparisonResponse{}, Internal("could not load period exposure entries", err)
 		}
@@ -149,15 +181,44 @@ func (service *DoseBudgetAssessmentService) Compare(
 			return dto.ScenarioComparisonResponse{}, err
 		}
 		response := assessmentResponse(assessment, plan, worker)
+		response.AsOf = resolvedScenario.AsOf
+		response.AsOfSource = string(resolvedScenario.Origin)
 		responses = append(responses, response)
 		if dosebudget.RiskRank(response.RiskBand) > dosebudget.RiskRank(highest) {
 			highest = response.RiskBand
 		}
 	}
+	notice := ""
+	if mismatch {
+		notice = dosebudget.AsOfMismatchNotice()
+	}
 	return dto.ScenarioComparisonResponse{
-		WorkerID: worker.ID, PeriodDoseMSV: responses[0].PeriodDoseMSV, Scenarios: responses,
+		WorkerID: worker.ID, PeriodDoseMSV: responses[0].PeriodDoseMSV, AsOfAnchor: anchor,
+		AsOfMismatch: mismatch, AsOfNotice: notice, Scenarios: responses,
 		HighestRiskBand: highest, BoundaryStatement: dosebudget.BoundaryStatement,
 	}, nil
+}
+
+// normalizeCompareScenarios accepts both the new per-scenario payload and the
+// legacy flat plan_ids payload, preserving the old request contract.
+func normalizeCompareScenarios(request dto.CompareDoseBudgetRequest) ([]dto.CompareScenarioInput, error) {
+	if len(request.Scenarios) > 0 {
+		if len(request.PlanIDs) > 0 {
+			return nil, BadRequest("invalid_compare_request", "send either scenarios or plan_ids, not both")
+		}
+		if len(request.Scenarios) < 2 {
+			return nil, BadRequest("invalid_compare_request", "compare at least two scenarios")
+		}
+		return request.Scenarios, nil
+	}
+	if len(request.PlanIDs) < 2 {
+		return nil, BadRequest("invalid_compare_request", "compare at least two plans")
+	}
+	scenarios := make([]dto.CompareScenarioInput, 0, len(request.PlanIDs))
+	for _, planID := range request.PlanIDs {
+		scenarios = append(scenarios, dto.CompareScenarioInput{PlanID: planID})
+	}
+	return scenarios, nil
 }
 
 func (service *DoseBudgetAssessmentService) Submit(
@@ -406,7 +467,8 @@ func assessmentResponse(
 		InputSnapshot: snapshot, PeriodDoseMSV: assessment.PeriodDoseMSV, ProjectedDoseMSV: assessment.ProjectedDoseMSV,
 		RemainingAdminMSV: assessment.RemainingAdminMSV, RemainingLegalMSV: assessment.RemainingLegalMSV,
 		RiskBand: assessment.RiskBand, Evidence: evidence, ThresholdVersion: assessment.ThresholdVersion,
-		PlanVersion: plan.Version, WorkerVersion: assessment.WorkerVersion, CreatedAt: assessment.CreatedAt,
+		PlanVersion: plan.Version, WorkerVersion: assessment.WorkerVersion,
+		AsOf: evidence.PeriodEnd, AsOfSource: "assessment", CreatedAt: assessment.CreatedAt,
 		ReviewedBy: assessment.ReviewedBy, ReviewedAt: assessment.ReviewedAt, ReviewNote: assessment.ReviewNote,
 	}
 }
